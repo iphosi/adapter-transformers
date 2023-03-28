@@ -18,6 +18,10 @@ CONFIG_CLASS_KEYS_MAPPING = {
     },
     "beit": {},
     "bert": {},
+    "bloom": {
+        "num_hidden_layers": "n_layer",
+        "num_attention_heads": "n_head",
+    },
     "clip_vision_model": {
         "hidden_dropout_prob": "dropout",
         "attention_probs_dropout_prob": "attention_dropout",
