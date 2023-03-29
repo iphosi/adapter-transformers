@@ -408,7 +408,7 @@ class BloomMLP(nn.Module):
 
         output = output_adapters(intermediate_output, residual, None)
 
-        output = dropout_add(output, self.hidden_dropout, self.training)
+        output = dropout_add(output, torch.zeros_like(output),self.hidden_dropout, self.training)
 
         return output
 
