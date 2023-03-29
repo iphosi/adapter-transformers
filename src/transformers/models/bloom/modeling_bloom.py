@@ -752,6 +752,8 @@ class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
 
         hidden_states = self.word_embeddings_layernorm(inputs_embeds)
 
+        output_shape = (batch_size, seq_length) + (hidden_states.size(-1),)
+
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
