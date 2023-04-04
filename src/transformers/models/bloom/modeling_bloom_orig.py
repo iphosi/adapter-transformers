@@ -24,19 +24,6 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
 from torch.nn import functional as F
 
-from ...activations import ACT2FN
-from ...adapters.composition import adjust_tensors_for_parallel
-from ...adapters.context import ForwardContext
-from ...adapters.lora import Linear as LoRALinear
-from ...adapters.lora import MergedLinear as LoRAMergedLinear
-from ...adapters.mixins.bloom import (
-    BloomDecoderBlockAdaptersMixin,
-    BloomModelAdapterMixin,
-    BloomModelWithHeadsAdaptersMixin,
-)
-from ...adapters.prefix_tuning import PrefixTuningShim
-from ...adapters.layer import AdapterLayer
-
 from ...file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -299,7 +286,6 @@ class BloomAttention(nn.Module):
         head_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
-        attention_adapters: AdapterLayer = None,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
 
@@ -373,8 +359,7 @@ class BloomAttention(nn.Module):
         else:
             output_tensor = self.dense(context_layer)
 
-        output_tensor = attention_adapters(output_tensor, residual, None)
-        output_tensor = dropout_add(output_tensor, torch.zeros_like(output_tensor), self.hidden_dropout, self.training)
+        output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
 
         outputs = (output_tensor, present)
         if output_attentions:
@@ -395,7 +380,7 @@ class BloomMLP(nn.Module):
         self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
         self.hidden_dropout = config.hidden_dropout
 
-    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor, output_adapters) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
 
         if self.pretraining_tp > 1 and self.slow_but_exact:
@@ -409,17 +394,14 @@ class BloomMLP(nn.Module):
         else:
             intermediate_output = self.dense_4h_to_h(hidden_states)
 
-        output = output_adapters(intermediate_output, residual, None)
-        output = dropout_add(output, torch.zeros_like(output), self.hidden_dropout, self.training)
+        output = dropout_add(intermediate_output, residual, self.hidden_dropout, self.training)
 
         return output
 
 
-class BloomBlock(BloomDecoderBlockAdaptersMixin, nn.Module):
+class BloomBlock(nn.Module):
     def __init__(self, config: BloomConfig):
         super().__init__()
-        self.config = config
-
         hidden_size = config.hidden_size
 
         self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
@@ -431,8 +413,6 @@ class BloomBlock(BloomDecoderBlockAdaptersMixin, nn.Module):
 
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
         self.hidden_dropout = config.hidden_dropout
-
-        self._init_adapter_modules()
 
     def forward(
         self,
@@ -465,7 +445,6 @@ class BloomBlock(BloomDecoderBlockAdaptersMixin, nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            attention_adapters=self.attention_adapters
         )
 
         attention_output = attn_outputs[0]
@@ -481,7 +460,7 @@ class BloomBlock(BloomDecoderBlockAdaptersMixin, nn.Module):
             residual = attention_output
 
         # MLP.
-        output = self.mlp(layernorm_output, residual, self.output_adapters)
+        output = self.mlp(layernorm_output, residual)
 
         if use_cache:
             outputs = (output,) + outputs
@@ -640,7 +619,7 @@ BLOOM_INPUTS_DOCSTRING = r"""
     "The bare Bloom Model transformer outputting raw hidden-states without any specific head on top.",
     BLOOM_START_DOCSTRING,
 )
-class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
+class BloomModel(BloomPreTrainedModel):
     def __init__(self, config: BloomConfig):
         super().__init__(config)
 
@@ -658,8 +637,6 @@ class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
-
-        self._init_adapter_modules()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -698,7 +675,6 @@ class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
         output_type=BaseModelOutputWithPastAndCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
     )
-    @ForwardContext.wrap
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -749,11 +725,8 @@ class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
-        inputs_embeds = self.invertible_adapters_forward(inputs_embeds)
 
         hidden_states = self.word_embeddings_layernorm(inputs_embeds)
-
-        output_shape = (batch_size, seq_length) + (hidden_states.size(-1),)
 
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
@@ -817,11 +790,6 @@ class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
                 )
 
             hidden_states = outputs[0]
-            (attention_mask,) = adjust_tensors_for_parallel(hidden_states, attention_mask)
-            # also adjust output shape if necessary
-            if getattr(ForwardContext.get_context(), "adapters_parallelized", False):
-                output_shape = hidden_states.size()
-
             if use_cache is True:
                 presents = presents + (outputs[1],)
 
@@ -830,8 +798,6 @@ class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
 
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)
-
-        hidden_states = hidden_states.view(output_shape)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -854,7 +820,7 @@ class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
     """,
     BLOOM_START_DOCSTRING,
 )
-class BloomForCausalLM(BloomModelWithHeadsAdaptersMixin, BloomPreTrainedModel):
+class BloomForCausalLM(BloomPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
     def __init__(self, config: BloomConfig):
@@ -1011,7 +977,7 @@ class BloomForCausalLM(BloomModelWithHeadsAdaptersMixin, BloomPreTrainedModel):
     """,
     BLOOM_START_DOCSTRING,
 )
-class BloomForSequenceClassification(BloomModelWithHeadsAdaptersMixin, BloomPreTrainedModel):
+class BloomForSequenceClassification(BloomPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
     def __init__(self, config: BloomConfig):
@@ -1139,7 +1105,7 @@ class BloomForSequenceClassification(BloomModelWithHeadsAdaptersMixin, BloomPreT
     """,
     BLOOM_START_DOCSTRING,
 )
-class BloomForTokenClassification(BloomModelWithHeadsAdaptersMixin, BloomPreTrainedModel):
+class BloomForTokenClassification(BloomPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
     def __init__(self, config: BloomConfig):
@@ -1240,7 +1206,7 @@ class BloomForTokenClassification(BloomModelWithHeadsAdaptersMixin, BloomPreTrai
     """,
     BLOOM_START_DOCSTRING,
 )
-class BloomForQuestionAnswering(BloomModelWithHeadsAdaptersMixin, BloomPreTrainedModel):
+class BloomForQuestionAnswering(BloomPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
     def __init__(self, config):
