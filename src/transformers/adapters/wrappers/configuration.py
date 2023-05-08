@@ -21,6 +21,8 @@ CONFIG_CLASS_KEYS_MAPPING = {
     "bloom": {
         "num_hidden_layers": "n_layer",
         "num_attention_heads": "n_head",
+        "hidden_dropout_prob": "hidden_dropout",
+        "attention_probs_dropout_prob": "attention_dropout"
     },
     "clip_vision_model": {
         "hidden_dropout_prob": "dropout",
